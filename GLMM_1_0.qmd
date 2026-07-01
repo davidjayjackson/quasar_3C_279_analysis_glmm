@@ -1,0 +1,302 @@
+---
+title: "GLMM: Fixed and Random Effects on Wolf Numbers"
+author: "AAVSO Solar Section"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+# Packages -------------------------------------------------------------------
+library(tidyverse)
+library(hglm)
+library(MASS)
+library(scales)    # for plot formatting
+library(patchwork) # for combining plots
+
+# Project root ---------------------------------------------------------------
+WD <- "C:/Users/Owner/Documents/SSN3"
+
+# Reporting period: previous calendar month ----------------------------------
+today  <- Sys.Date()
+yr_num <- as.integer(format(today, "%Y"))
+mo_num <- as.integer(format(today, "%m")) - 1L
+
+if (mo_num == 0L) {          # roll back across December
+  yr_num <- yr_num - 1L
+  mo_num <- 12L
+}
+
+yr  <- as.character(yr_num)
+mo  <- sprintf("%02d", mo_num)   # zero-padded month
+Ex  <- paste0(yr, mo)            # e.g. "202602"
+ver <- "00"
+
+# Solar Cycle 25 start date (December 2019, SIDC/NASA/NOAA declaration) ------
+# Edit CYCLE_START_YEAR and CYCLE_START_MONTH to change the filter window.
+CYCLE_START_YEAR  <- 2019L
+CYCLE_START_MONTH <- 12L
+
+cat("Reporting period:", Ex, "| version:", ver, "\n")
+cat("Data filtered from SC25 start: ",
+    CYCLE_START_YEAR, "/", sprintf("%02d", CYCLE_START_MONTH), "\n", sep = "")
+```
+
+```{r utilities}
+# Utility functions ----------------------------------------------------------
+
+#' Standard error
+se <- function(x) sqrt(var(x, na.rm = TRUE) / sum(!is.na(x)))
+
+#' Confidence interval around the mean
+ci_mean <- function(x, conf = 0.95) {
+  n      <- sum(!is.na(x))
+  margin <- qt(conf + (1 - conf) / 2, df = n - 1) * se(x)
+  tibble(
+    mean  = mean(x, na.rm = TRUE),
+    lower = mean(x, na.rm = TRUE) - margin,
+    upper = mean(x, na.rm = TRUE) + margin,
+    conf  = conf
+  )
+}
+
+#' +/-3 SD summary
+sd3 <- function(x) {
+  m <- round(mean(x, na.rm = TRUE), 3)
+  s <- round(sd(x,   na.rm = TRUE), 3)
+  tibble(
+    label = c("-3sd", "-2sd", "-1sd", "Mean", "+1sd", "+2sd", "+3sd"),
+    value = c(m - 3*s, m - 2*s, m - s, m, m + s, m + 2*s, m + 3*s)
+  )
+}
+
+#' Read a CSV from the project Data/ folder
+fetch <- function(filename) {
+  path <- file.path(WD, "Data", paste0(filename, ".csv"))
+  read_csv(path, show_col_types = FALSE)
+}
+
+#' Write a CSV to the project Data/ folder
+write_csv_out <- function(df, filename) {
+  path <- file.path(WD, "Data", paste0(filename, ".csv"))
+  write_csv(df, path)
+  invisible(path)
+}
+```
+
+```{r load-data}
+# Load data ------------------------------------------------------------------
+load(file.path(WD, "ymtd.RData"))   # loads as X
+
+X_full <- as_tibble(X)   # retain full history if needed later
+
+# Filter to Solar Cycle 25 start ---------------------------------------------
+# Requires columns named 'year' and 'mon' (integer); adjust if named differently.
+X <- X_full |>
+  filter(
+    year > CYCLE_START_YEAR |
+    (year == CYCLE_START_YEAR & mon >= CYCLE_START_MONTH)
+  )
+
+n_dropped <- nrow(X_full) - nrow(X)
+cat(sprintf(
+  "Rows loaded: %d total | %d pre-SC25 dropped | %d retained\n",
+  nrow(X_full), n_dropped, nrow(X)
+))
+
+glimpse(X)
+summary(X)
+```
+
+\newpage
+
+# Wolf Number Distribution
+
+Folks even re-define the solar dynamo as the "solar alternator":
+<https://journal.geophysicsjournal.com/JofG/article/view/320/260#nav-menu>
+
+## Histogram with Theoretical Overlays
+
+```{r wolf-histogram, fig.width=7, fig.height=5}
+# Wolf number histogram ------------------------------------------------------
+
+w_mean <- mean(X$w, na.rm = TRUE)
+w_sd   <- sd(X$w,   na.rm = TRUE)
+w_var  <- var(X$w,  na.rm = TRUE)
+
+cat(sprintf("Wolf number  mean = %.3f   variance = %.3f\n", w_mean, w_var))
+
+# Freedman-Diaconis bin width
+bwidth <- diff(range(X$w, na.rm = TRUE)) /
+          nclass.FD(na.omit(X$w))
+
+plot_title <- paste0(Ex, " v", ver, " Wolf Number Distribution")
+
+p_hist <- ggplot(X, aes(x = w)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth  = bwidth,
+    fill      = "grey80",
+    colour    = "grey45",
+    linewidth = 0.3
+  ) +
+  # Normal overlay
+  stat_function(
+    aes(colour = "Normal"),
+    fun       = dnorm,
+    args      = list(mean = w_mean, sd = w_sd),
+    linewidth = 0.9
+  ) +
+  # Poisson overlay (integer support)
+  geom_point(
+    data = tibble(
+      w    = 0:max(X$w, na.rm = TRUE),
+      dens = dpois(0:max(X$w, na.rm = TRUE), lambda = w_mean)
+    ),
+    aes(x = w, y = dens, colour = "Poisson"),
+    size = 1.2
+  ) +
+  scale_colour_manual(
+    name   = "Theoretical density",
+    values = c(Normal = "black", Poisson = "firebrick")
+  ) +
+  labs(
+    title = plot_title,
+    x     = "Wolf Number",
+    y     = "Density"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+p_hist
+
+# Save plot
+ggsave(
+  filename = file.path(WD, "Plots", paste0(Ex, ver, "HistW.png")),
+  plot     = p_hist,
+  width    = 7,
+  height   = 5,
+  dpi      = 150
+)
+```
+
+\newpage
+
+# HGLM: Hierarchical Generalised Linear Model
+
+## Model Fitting
+
+Wolf numbers are overdispersed counts. A **quasipoisson** fixed-effects family with a **Gamma**
+random-effects family accounts for both the count nature of the data and between-observer
+heterogeneity.
+
+- **Fixed effects:** `see`, `sidc`, `year`, `mon` -- known reference counts and temporal structure
+- **Random effect:** `(1 | obs)` -- observer-level intercept capturing systematic reporting differences
+
+```{r hglm-fit, results='asis'}
+part <- "hglm"
+
+m1 <- hglm(
+  fixed       = w ~ see + sidc + year + mon,
+  random      = ~ 1 | obs,
+  family      = quasipoisson(link = "log"),
+  rand.family = Gamma(link = "log"),
+  data        = X
+)
+
+print(summary(m1), print.ranef = TRUE)
+
+# Save model -----------------------------------------------------------------
+model_path <- file.path(WD, "models", paste0(Ex, ver, part, ".RData"))
+m <- m1
+save(m, file = model_path, ascii = FALSE)
+cat("\nModel saved to:", model_path, "\n")
+```
+
+\newpage
+
+# Exploratory Analysis of HGLM
+
+```{r hglm-explore}
+# Reload saved model ---------------------------------------------------------
+load(model_path)
+
+ms <- summary(m)
+print(ms, print.ranef = TRUE)
+
+# Flagged observations (hat-value = 1 candidates) ----------------------------
+if (length(m$bad) > 0) {
+  cat("Flagged observations (m$bad):", m$bad, "\n")
+} else {
+  cat("No flagged observations.\n")
+}
+
+# Fitted vs. observed --------------------------------------------------------
+# hglm has no $frame; recover observed as fitted + working residual
+diag_df <- tibble(
+  fitted   = m$fv,
+  residual = m$resid,
+  observed = m$fv + m$resid
+)
+
+cat(sprintf(
+  "\nFitted values -- mean: %.3f   variance: %.3f   ratio: %.3f\n",
+  mean(diag_df$fitted),
+  var(diag_df$fitted),
+  var(diag_df$fitted) / mean(diag_df$fitted)
+))
+```
+
+## Diagnostic Plots
+
+```{r hglm-diagnostics, fig.width=10, fig.height=4}
+p1 <- ggplot(diag_df, aes(x = fitted, y = residual)) +
+  geom_point(alpha = 0.3, size = 1, colour = "steelblue") +
+  geom_hline(yintercept = 0, colour = "firebrick", linewidth = 0.7) +
+  geom_smooth(method = "loess", se = FALSE,
+              colour = "grey30", linewidth = 0.7, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values", y = "Residual") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(diag_df, aes(sample = residual)) +
+  stat_qq(alpha = 0.3, size = 1, colour = "steelblue") +
+  stat_qq_line(colour = "firebrick", linewidth = 0.7) +
+  labs(title = "Normal Q-Q of Residuals",
+       x = "Theoretical quantiles", y = "Sample quantiles") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p1 + p2
+
+# Save diagnostics
+ggsave(
+  filename = file.path(WD, "Plots", paste0(Ex, ver, part, "Diag.png")),
+  plot     = p1 + p2,
+  width    = 10,
+  height   = 4,
+  dpi      = 150
+)
+```
+
+## SD Summary of Wolf Numbers
+
+```{r sd-summary}
+sd3(X$w) |>
+  knitr::kable(
+    digits    = 3,
+    caption   = "Wolf Number +/-3 SD Summary",
+    col.names = c("Label", "Value")
+  )
+```
