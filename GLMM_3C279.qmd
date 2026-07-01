@@ -331,6 +331,54 @@ v_dat |>
   kable(digits = 3, caption = "V band only: brightness and variability by epoch")
 ```
 
+```{r vonly-lightcurve, fig.width=10, fig.height=5}
+# Full V-band history (all dates, so the 2022 transition is visible too).
+v_all <- dat |>
+  filter(band == "V") |>
+  mutate(epoch = case_when(
+    date <  PRE_END      ~ "pre_2022",
+    date >= DIMMING_FROM ~ "dimming_2023on",
+    TRUE                 ~ "2022 (transition)"
+  ))
+
+# Per-epoch mean magnitude, drawn as horizontal levels to show the dimming.
+v_levels <- v_all |>
+  filter(epoch != "2022 (transition)") |>
+  group_by(epoch) |>
+  summarise(
+    xmin = min(date), xmax = max(date), mean_mag = mean(mag), .groups = "drop"
+  )
+
+ggplot(v_all, aes(date, mag)) +
+  annotate("rect", xmin = PRE_END, xmax = DIMMING_FROM,
+           ymin = -Inf, ymax = Inf, alpha = 0.08, fill = "grey20") +
+  geom_point(aes(colour = epoch), alpha = 0.5, size = 1.1) +
+  geom_segment(
+    data = v_levels,
+    aes(x = xmin, xend = xmax, y = mean_mag, yend = mean_mag),
+    colour = "black", linewidth = 0.9, linetype = "solid"
+  ) +
+  geom_vline(xintercept = c(PRE_END, DIMMING_FROM),
+             linetype = "dashed", colour = "grey40") +
+  scale_y_reverse() +                       # brighter (smaller mag) at the top
+  scale_colour_manual(values = c(
+    "pre_2022"          = "steelblue",
+    "2022 (transition)" = "grey55",
+    "dimming_2023on"    = "firebrick"
+  )) +
+  labs(
+    title    = "3C 279 — Johnson V light curve",
+    subtitle = "Black lines = per-epoch mean magnitude; shaded = 2022 transition (excluded)",
+    x = NULL, y = "V magnitude (fainter →)", colour = "Epoch"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+The single-band view makes the shift unambiguous: the 2023-onward cloud (red)
+sits both **lower** (fainter) and **tighter** (less scattered) than the pre-2022
+cloud (blue), with the per-epoch mean levels showing the ~1.7 mag drop directly.
+
 With a single band there is no random effect to include, so we fit a
 location–scale model with `epoch` in **both** the mean and the dispersion:
 
