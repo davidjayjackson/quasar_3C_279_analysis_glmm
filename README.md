@@ -11,6 +11,8 @@ The analysis lives in **[`GLMM_3C279.qmd`](GLMM_3C279.qmd)** (Quarto/R), which r
 
 📊 **Read the rendered report:** https://davidjayjackson.github.io/quasar_3C_279_analysis_glmm/
 
+[![Report preview](images/report-preview.png)](https://davidjayjackson.github.io/quasar_3C_279_analysis_glmm/)
+
 It compares 3C 279's brightness and variability before 2022 vs. from 2023 onward (2022 excluded as a transition year), using:
 
 - a linear mixed model, `mag ~ epoch + (1 | band)`, for the change in mean brightness;
