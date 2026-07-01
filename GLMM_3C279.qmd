@@ -1,0 +1,397 @@
+---
+title: "3C 279: Modelling Brightness and Variability Before vs. After the 2023 Dimming"
+subtitle: "A mixed-effects (GLMM/LMM) analysis of AAVSO magnitudes"
+author: "AAVSO — analysis for Rodney H"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+# Packages -------------------------------------------------------------------
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(patchwork)
+library(lme4)      # linear mixed model (mean structure)
+library(glmmTMB)   # location-scale model: lets us model the *variance* too
+library(broom.mixed)
+library(knitr)
+
+# Project root ---------------------------------------------------------------
+# All paths are relative to this .qmd so the report is portable.
+WD       <- getwd()
+DATA_CSV <- file.path(WD, "rawdata_279-3C_cleaned.csv")
+
+# Epoch boundaries -----------------------------------------------------------
+# The scientific question: has variability changed since the 2023 dimming?
+# We compare the "pre" era (before 2022) with the "dimming" era (2023 onward),
+# treating 2022 as a transition year that is EXCLUDED from the contrast so the
+# two groups are cleanly separated.
+PRE_END      <- ymd("2022-01-01")  # observations before this date = "pre_2022"
+DIMMING_FROM <- ymd("2023-01-01")  # observations on/after this date = "dimming_2023on"
+```
+
+```{r utilities}
+# Utility functions ----------------------------------------------------------
+
+#' Julian Date -> calendar Date (UTC).
+#' JD 2440587.5 corresponds to 1970-01-01 00:00 UTC (the Unix epoch).
+jd_to_date <- function(jd) as.Date(jd - 2440587.5, origin = "1970-01-01")
+
+#' Standard error of the mean
+se <- function(x) sqrt(var(x, na.rm = TRUE) / sum(!is.na(x)))
+
+#' +/-3 SD summary (kept from the AAVSO template for a familiar readout)
+sd3 <- function(x) {
+  m <- round(mean(x, na.rm = TRUE), 3)
+  s <- round(sd(x,   na.rm = TRUE), 3)
+  tibble(
+    label = c("-3sd", "-2sd", "-1sd", "Mean", "+1sd", "+2sd", "+3sd"),
+    value = c(m - 3*s, m - 2*s, m - s, m, m + s, m + 2*s, m + 3*s)
+  )
+}
+```
+
+# Abstract {.unnumbered}
+
+::: {.callout-note appearance="simple"}
+**In plain language.** This report asks whether the quasar **3C 279** has really
+dimmed since 2023, and whether its brightness has become steadier or more
+erratic — using AAVSO amateur observations going back to about 1999.
+
+The answer to both is **yes, it changed — it is now fainter *and* quieter.**
+Comparing the years before 2022 with 2023 onward (2022 is left out as a
+transition), and looking at the well-standardised Johnson **V** filter so we
+compare like with like, 3C 279 is about **1.7 magnitudes fainter** than before
+(a magnitude is a factor of ~2.5 in brightness, so this is a large drop), and
+its night-to-night scatter has roughly **halved**. In other words, the object
+didn't just dim — it also settled into a calmer, less variable state.
+
+One important subtlety, spelled out in the analysis: if you lump *all* filters
+together, the "quieter" signal almost disappears. That is not because the source
+stayed variable — it is because different filters were used in different eras and
+they have different natural scatter. Once we hold the filter fixed (the V-only
+check), the drop in variability is clear. This is exactly the kind of confound
+the mixed-effects model is designed to handle.
+
+*Everything below shows the data cleaning, the statistical models, and the
+diagnostic checks behind these two conclusions.*
+:::
+
+# Data
+
+## Load and clean
+
+The raw file has columns `JD`, `mag`, `I_Magnitude`, `band`, `val`.
+
+- `I_Magnitude` is constant (all `0`) and carries no information — dropped.
+- `val` is a free-text note field ("Z", "V", exposure strings) — not used in the model.
+- `band` is the photometric passband. **Magnitudes are not comparable across
+  bands**, so band is a first-class effect in the model, and non-photometric /
+  junk codes (`N/A`, `TG`, `SR`, `CV`) are removed.
+- Rows with a missing `mag` are dropped.
+
+```{r load-clean}
+raw <- read_csv(DATA_CSV, show_col_types = FALSE)
+
+# Photometric bands we trust for a magnitude comparison.
+KEEP_BANDS <- c("V", "CR", "B", "R", "I", "Vis.")
+
+dat <- raw |>
+  transmute(
+    jd    = as.numeric(JD),
+    mag   = as.numeric(mag),
+    band  = as.character(band)
+  ) |>
+  filter(!is.na(jd), !is.na(mag), band %in% KEEP_BANDS) |>
+  mutate(
+    date  = jd_to_date(jd),
+    year  = year(date),
+    band  = factor(band, levels = KEEP_BANDS)
+  ) |>
+  # Guard against obviously bad magnitudes (3C 279 lives ~11-18 mag).
+  filter(mag > 8, mag < 20) |>
+  arrange(date)
+
+cat(sprintf("Rows: %d raw -> %d after cleaning\n", nrow(raw), nrow(dat)))
+glimpse(dat)
+```
+
+## Define the epoch contrast
+
+```{r epochs}
+model_dat <- dat |>
+  mutate(
+    epoch = case_when(
+      date <  PRE_END      ~ "pre_2022",
+      date >= DIMMING_FROM ~ "dimming_2023on",
+      TRUE                 ~ NA_character_        # 2022 transition -> excluded
+    )
+  ) |>
+  filter(!is.na(epoch)) |>
+  mutate(epoch = factor(epoch, levels = c("pre_2022", "dimming_2023on")))
+
+# How much data, and which bands, land in each epoch?
+model_dat |>
+  count(epoch, band) |>
+  pivot_wider(names_from = band, values_from = n, values_fill = 0) |>
+  kable(caption = "Observation counts by epoch and band (2022 excluded as transition)")
+
+model_dat |>
+  group_by(epoch) |>
+  summarise(
+    n         = n(),
+    mean_mag  = mean(mag),
+    sd_mag    = sd(mag),
+    var_mag   = var(mag),
+    .groups   = "drop"
+  ) |>
+  kable(digits = 3,
+        caption = "Brightness (mean) and variability (SD/variance) by epoch")
+```
+
+> Reminder on magnitudes: **larger `mag` = fainter**. If the object has dimmed
+> since 2023, we expect a *higher* mean magnitude in the `dimming_2023on` epoch.
+
+\newpage
+
+# The light curve
+
+```{r light-curve, fig.width=10, fig.height=5}
+p_lc <- ggplot(dat, aes(x = date, y = mag, colour = band)) +
+  geom_point(alpha = 0.35, size = 0.9) +
+  # Shade the excluded 2022 transition band.
+  annotate("rect", xmin = PRE_END, xmax = DIMMING_FROM,
+           ymin = -Inf, ymax = Inf, alpha = 0.08, fill = "grey20") +
+  geom_vline(xintercept = c(PRE_END, DIMMING_FROM),
+             linetype = "dashed", colour = "grey40") +
+  scale_y_reverse() +                       # brighter (smaller mag) at the top
+  labs(
+    title    = "3C 279 — AAVSO light curve with epoch split",
+    subtitle = "Shaded band = 2022 transition (excluded from the contrast)",
+    x = NULL, y = "Magnitude (fainter →)", colour = "Band"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_lc
+```
+
+# Distribution by epoch
+
+```{r dist-by-epoch, fig.width=9, fig.height=4.5}
+ggplot(model_dat, aes(x = mag, fill = epoch)) +
+  geom_density(alpha = 0.45) +
+  scale_x_reverse() +
+  scale_fill_manual(values = c(pre_2022 = "steelblue",
+                               dimming_2023on = "firebrick")) +
+  labs(title = "Magnitude distribution: pre-2022 vs. 2023-onward",
+       x = "Magnitude (fainter →)", y = "Density", fill = "Epoch") +
+  theme_minimal(base_size = 12)
+```
+
+\newpage
+
+# Model 1 — Mean brightness (LMM)
+
+We first model the **mean** magnitude. Magnitude is a continuous measurement, so
+this is a linear mixed model (Gaussian response), not a count GLM.
+
+- **Fixed effect:** `epoch` — the pre-vs-post contrast we care about.
+- **Random effect:** `(1 | band)` — each passband gets its own intercept,
+  absorbing the systematic zero-point differences between filters.
+
+$$\text{mag}_{ij} = \beta_0 + \beta_1\,\text{epoch}_i + b_j^{\text{band}} + \varepsilon_{ij}$$
+
+```{r lmm-fit}
+m_mean <- lmer(mag ~ epoch + (1 | band), data = model_dat, REML = TRUE)
+summary(m_mean)
+```
+
+```{r lmm-effect}
+# The epoch coefficient = change in mean magnitude, holding band constant.
+tidy(m_mean, effects = "fixed", conf.int = TRUE) |>
+  kable(digits = 4,
+        caption = "Fixed effects. 'epochdimming_2023on' > 0 means fainter since 2023.")
+```
+
+# Model 2 — Variability (location–scale GLMM)
+
+The central question is about **variability**, not just the average. A standard
+mixed model assumes one common residual variance. Here we let the residual
+**dispersion depend on epoch** via `glmmTMB`'s `dispformula`, so the model
+estimates a separate spread for each era and tests whether they differ.
+
+```{r ls-fit}
+m_scale <- glmmTMB(
+  mag ~ epoch + (1 | band),
+  dispformula = ~ epoch,          # <- variance is allowed to change by epoch
+  data   = model_dat,
+  family = gaussian()
+)
+summary(m_scale)
+```
+
+```{r ls-interpret}
+# Back-transform the dispersion model to a residual SD per epoch.
+disp <- fixef(m_scale)$disp
+sd_pre     <- sqrt(exp(disp[["(Intercept)"]]))
+sd_dimming <- sqrt(exp(disp[["(Intercept)"]] + disp[["epochdimming_2023on"]]))
+
+tibble(
+  epoch          = c("pre_2022", "dimming_2023on"),
+  residual_sd    = c(sd_pre, sd_dimming)
+) |>
+  kable(digits = 3,
+        caption = "Model-estimated residual SD by epoch (the variability answer)")
+
+cat(sprintf(
+  "Variability change: residual SD goes from %.3f (pre-2022) to %.3f (2023 on) — a %.0f%% %s.\n",
+  sd_pre, sd_dimming,
+  100 * abs(sd_dimming - sd_pre) / sd_pre,
+  ifelse(sd_dimming > sd_pre, "increase", "decrease")
+))
+```
+
+## Cross-check: simple variance test
+
+An independent, model-free check on the same claim.
+
+```{r var-test}
+var.test(mag ~ epoch, data = model_dat) |>
+  broom::tidy() |>
+  kable(digits = 4, caption = "F test for equal variances between epochs")
+```
+
+\newpage
+
+# Diagnostics
+
+```{r diagnostics, fig.width=10, fig.height=4}
+diag_df <- tibble(
+  fitted   = fitted(m_mean),
+  residual = resid(m_mean)
+)
+
+p1 <- ggplot(diag_df, aes(fitted, residual)) +
+  geom_point(alpha = 0.3, size = 1, colour = "steelblue") +
+  geom_hline(yintercept = 0, colour = "firebrick") +
+  geom_smooth(method = "loess", se = FALSE,
+              colour = "grey30", linetype = "dashed") +
+  labs(title = "Residuals vs Fitted", x = "Fitted", y = "Residual") +
+  theme_minimal(base_size = 11)
+
+p2 <- ggplot(diag_df, aes(sample = residual)) +
+  stat_qq(alpha = 0.3, size = 1, colour = "steelblue") +
+  stat_qq_line(colour = "firebrick") +
+  labs(title = "Normal Q-Q", x = "Theoretical", y = "Sample") +
+  theme_minimal(base_size = 11)
+
+p1 + p2
+```
+
+# +/-3 SD summary by epoch
+
+```{r sd-summary}
+model_dat |>
+  group_by(epoch) |>
+  group_modify(~ sd3(.x$mag)) |>
+  pivot_wider(names_from = epoch, values_from = value) |>
+  kable(digits = 3, caption = "Magnitude +/-3 SD summary by epoch")
+```
+
+\newpage
+
+# Sensitivity check — Johnson V band only {#sec-vonly}
+
+The pooled models above adjust for band with a random intercept, but they still
+pool the **residual scatter** across bands whose composition shifts over time
+(recent years are `CR`-heavy). To check whether the variability conclusion is an
+artifact of that shift, we repeat the analysis on the single most homogeneous,
+well-populated passband — **Johnson `V`** — where a like-for-like comparison
+needs no band effect at all.
+
+```{r vonly-data}
+v_dat <- model_dat |> filter(band == "V") |> droplevels()
+
+v_dat |>
+  group_by(epoch) |>
+  summarise(n = n(), mean_mag = mean(mag), sd_mag = sd(mag), .groups = "drop") |>
+  kable(digits = 3, caption = "V band only: brightness and variability by epoch")
+```
+
+With a single band there is no random effect to include, so we fit a
+location–scale model with `epoch` in **both** the mean and the dispersion:
+
+```{r vonly-fit}
+m_v <- glmmTMB(
+  mag ~ epoch,
+  dispformula = ~ epoch,
+  data   = v_dat,
+  family = gaussian()
+)
+summary(m_v)
+
+# Mean shift and per-epoch residual SD, back-transformed.
+dv <- fixef(m_v)$disp
+tibble(
+  quantity = c("mean shift (mag, + = fainter)",
+               "residual SD pre_2022",
+               "residual SD dimming_2023on"),
+  value = c(
+    fixef(m_v)$cond[["epochdimming_2023on"]],
+    sqrt(exp(dv[["(Intercept)"]])),
+    sqrt(exp(dv[["(Intercept)"]] + dv[["epochdimming_2023on"]]))
+  )
+) |>
+  kable(digits = 3, caption = "V-only: mean and variability change")
+```
+
+```{r vonly-vartest}
+var.test(mag ~ epoch, data = v_dat) |>
+  broom::tidy() |>
+  kable(digits = 4,
+        caption = "V-only F test for equal variances between epochs")
+```
+
+**Interpretation.** Restricted to a single band, the dimming (~1.7 mag fainter)
+persists **and** the variability drop that the pooled model washed out
+reappears clearly (residual SD roughly halves). This tells us the flat residual
+SD in the pooled model was driven by changing band composition, not by the
+source: measured like-for-like, 3C 279 has become both **fainter and quieter**
+since 2023.
+
+\newpage
+
+# Summary
+
+- **Data:** AAVSO magnitudes for 3C 279, cleaned to trusted photometric bands
+  (`r paste(KEEP_BANDS, collapse = ", ")`), spanning ~1999 to present.
+- **Mean brightness:** Model 1 estimates the average magnitude shift from the
+  pre-2022 era to the 2023-onward era (see the `epoch` coefficient — positive =
+  dimmer). The object is clearly fainter post-2023.
+- **Variability:** Model 2 (location–scale GLMM) estimates a **separate spread
+  for each epoch**. On the *pooled* data the residual SD looks nearly unchanged,
+  but that is a band-composition artifact — see the caveat below.
+- **Sensitivity check (@sec-vonly):** restricting to Johnson `V` alone removes
+  the band-mix confound and shows the variability genuinely **dropped** after
+  2023 (residual SD roughly halves), alongside the dimming. The like-for-like
+  conclusion is: 3C 279 became both fainter and quieter.
+- **Caveats:** epochs are unbalanced across bands (e.g. `CR` dominates recent
+  years); the `(1 | band)` term adjusts for filter zero-points but not for
+  changing band *composition* over time — which is exactly why the single-band
+  check matters. A useful next step is adding an observer effect if the raw
+  AAVSO download includes an observer code.
+```
+
